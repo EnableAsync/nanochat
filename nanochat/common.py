@@ -1,5 +1,5 @@
 """
-Common utilities for nanochat.
+nanochat 公共工具函数。
 """
 
 import os
@@ -151,7 +151,8 @@ def autodetect_device_type():
     return device_type
 
 def compute_init(device_type="cuda"): # cuda|cpu|mps
-    """Basic initialization that we keep doing over and over, so make common."""
+    """统一的计算环境初始化：随机种子 + 精度设置 + DDP 进程组。
+    多 GPU 时通过 torchrun 的环境变量自动检测并初始化 NCCL 后端。"""
 
     assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
     if device_type == "cuda":
@@ -159,28 +160,24 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
-    # Reproducibility
-    # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
+    # 可复现性：设置全局随机种子（模型初始化会用到）
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
 
-    # Precision
+    # 精度：启用 TF32（在 A100+ 上将 FP32 矩阵乘速度提升 ~3x，精度损失可忽略）
     if device_type == "cuda":
-        torch.backends.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
+        torch.backends.fp32_precision = "tf32"
 
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
+    # DDP 初始化：如果 torchrun 设置了环境变量，就初始化进程组
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
+        torch.cuda.set_device(device)  # 让 "cuda" 默认指向本 rank 的 GPU
+        dist.init_process_group(backend="nccl", device_id=device)  # NCCL: NVIDIA 的 GPU 集合通信库
+        dist.barrier()  # 等所有 rank 都初始化完毕
     else:
-        device = torch.device(device_type) # mps|cpu
+        device = torch.device(device_type)
 
     if ddp_rank == 0:
         logger.info(f"Distributed world size: {ddp_world_size}")
@@ -201,10 +198,11 @@ class DummyWandb:
     def finish(self):
         pass
 
-# hardcoded BF16 peak flops for various GPUs
-# inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
-# and PR: https://github.com/karpathy/nanochat/pull/147
+# 各型号 GPU 的 BF16 理论峰值 FLOPS（用于计算 MFU = 实际 FLOPS / 峰值 FLOPS）
+# MFU (Model FLOPs Utilization) 是衡量训练效率的核心指标
+# 来源: torchtitan / nanochat PR #147
 def get_peak_flops(device_name: str) -> float:
+    """返回指定 GPU 的 BF16 峰值 FLOPS。未知 GPU 返回 inf（使 MFU 显示为 0%）。"""
     name = device_name.lower()
 
     # Table order matters: more specific patterns first.

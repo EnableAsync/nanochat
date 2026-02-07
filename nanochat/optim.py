@@ -13,8 +13,8 @@ from torch import Tensor
 
 # -----------------------------------------------------------------------------
 """
-Good old AdamW optimizer, fused kernel.
-https://arxiv.org/abs/1711.05101
+AdamW 优化器，融合内核版。
+论文：https://arxiv.org/abs/1711.05101
 """
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -31,54 +31,57 @@ def adamw_step_fused(
     wd_t: Tensor,           # () - 0-D CPU tensor, weight decay
 ) -> None:
     """
-    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    融合 AdamW 步骤，对应论文的 5 步公式：
+    1. 权重衰减（解耦，先于更新应用）
+    2. 更新一阶矩 m（梯度的指数移动平均）
+    3. 更新二阶矩 v（梯度平方的指数移动平均）
+    4. 偏差修正（消除零初始化引入的偏差）
+    5. 参数更新：p -= lr * m_hat / (√v_hat + ε)
+    所有操作编译为一个图，消除 Python 逐 op 的开销。
+    0-D CPU tensor 避免超参变化时触发重编译。
     """
-    # Weight decay (decoupled, applied before the update)
+    # 步骤1: 解耦权重衰减（不经过 Adam 的动量，直接从参数减去）
     p.mul_(1 - lr_t * wd_t)
-    # Update running averages (lerp_ is cleaner and fuses well)
+    # 步骤2-3: 用 lerp_ 更新动量（等价于 m = β1*m + (1-β1)*g，但更快且融合友好）
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    # Bias corrections
+    # 步骤4: 偏差修正
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
-    # Compute update and apply
+    # 步骤5: 计算更新量并应用
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
 # -----------------------------------------------------------------------------
 """
-Muon optimizer adapted and simplified from modded-nanogpt.
+Muon 优化器，基于 modded-nanogpt 改编简化。
 https://github.com/KellerJordan/modded-nanogpt
 
-Background:
-Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-zero even beyond the point where the iteration no longer converges all the way to one everywhere
-on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-performance at all relative to UV^T, where USV^T = G is the SVD.
+核心思想：
+用 Newton-Schulz 迭代（这里用 Polar Express 变体）计算梯度矩阵 G 的"近似正交化"。
+直觉：对梯度做 SVD 分解 G = USV^T，取 UV^T 作为更新方向（即最近的正交矩阵）。
+这样每个更新的奇异值都被归一化为 ~1，避免参数矩阵的某些方向更新过快/过慢。
 
-Here, an alternative to Newton-Schulz iteration with potentially better convergence properties:
-Polar Express Sign Method for orthogonalization.
+实际上，为了速度，我们不做精确正交化，而是做 5 步 Polar Express 迭代，
+结果大约是 US'V^T（S' 对角线 ∈ [0.5, 1.5]），实验表明这对训练效果无损。
+
+Polar Express（Sign Method）：
 https://arxiv.org/pdf/2505.16932
-by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+比 Newton-Schulz 收敛更好。
 
-NorMuon variance reduction: per-neuron/column adaptive learning rate that normalizes
-update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
+NorMuon 方差缩减：对正交化后的更新做逐神经元（行/列）的自适应缩放，
+消除 Muon 输出跨神经元的尺度不均匀问题。
 https://arxiv.org/pdf/2510.05491
 
-Some of the changes in nanochat implementation:
-- Uses a simpler, more general approach to parameter grouping and stacking
-- Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
-- Makes no assumptions about model architecture (e.g. that attention weights are fused into QKVO format)
+nanochat 的实现特点：
+- 更通用的参数分组和 stack（不假设 QKVO 合并）
+- 单个融合 kernel 完成 momentum → polar_express → variance_reduction → update
 """
 
-# Coefficients for Polar Express (computed for num_iters=5, safety_factor=2e-2, cushion=2)
-# From https://arxiv.org/pdf/2505.16932
+# Polar Express 系数（num_iters=5, safety_factor=2e-2, cushion=2）
+# 每组 (a, b, c) 用于一步迭代：X_new = a*X + X @ (b * A + c * A²)（对宽矩阵则从左乘）
+# 这些系数经过优化，使零点斜率最大化 → 前几步收敛最快
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -101,32 +104,42 @@ def muon_step_fused(
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
 ) -> None:
     """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+    融合 Muon 步骤，4 阶段流水线：
+    1. Nesterov Momentum — 用前瞻动量使梯度更平滑
+    2. Polar Express — 对梯度做近似正交化（核心创新）
+    3. NorMuon 方差缩减 — 逐神经元归一化更新尺度
+    4. Cautious Update — 只更新梯度与参数同号的方向（减少振荡）
     """
 
-    # Nesterov momentum
+    # ---- 阶段1: Nesterov Momentum ----
+    # 先更新动量 buffer，再用动量做前瞻：g = grad + momentum * (momentum_buffer - grad)
+    # 这比普通 SGD momentum 多看了"未来一步"，收敛更快
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express
+    # ---- 阶段2: Polar Express（近似正交化）----
+    # 目标：将梯度矩阵 G 映射到最近的正交矩阵 UV^T
+    # 原理：对 X 迭代 X_new = a*X + X @ (b*A + c*A²)，其中 A = X^T @ X
+    # 5 步迭代后 X ≈ UV^T（奇异值归一化为 ~1）
     X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)  # 预归一化，1.02 是安全系数
+    if g.size(-2) > g.size(-1): # 高矩阵：A = X^T @ X（更小的矩阵乘法）
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X.mT @ X
             B = b * A + c * (A @ A)
             X = a * X + X @ B
-    else: # Wide matrix (original math)
+    else: # 宽矩阵：A = X @ X^T
         for a, b, c in polar_express_coeffs[:ns_steps]:
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     g = X
 
-    # Variance reduction
+    # ---- 阶段3: NorMuon 方差缩减 ----
+    # 正交化后不同行/列的更新尺度不均匀，需要逐行/列自适应缩放
+    # 用 EMA 跟踪每行/列的方差，然后 rsqrt 归一化（类似 Adam 的 v_hat）
+    # 关键：归一化后保持整体范数不变（v_norm / v_norm_new 缩放因子）
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -139,10 +152,11 @@ def muon_step_fused(
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
 
-    # Cautious weight decay + parameter update
+    # ---- 阶段4: Cautious Update ----
+    # 只在梯度方向与当前参数方向一致时才施加权重衰减（避免衰减有用的权重方向）
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
+    mask = (g * stacked_params) >= 0  # 梯度与参数同号 → 这个方向在"增强"参数
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
@@ -228,42 +242,43 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def _step_muon(self, group: dict) -> None:
         """
-        Muon update for all params in the group (stacked for efficiency).
-        Lazy init the state, fill in all 0-D tensors, call the fused kernel.
+        Muon 更新：将组内所有同 shape 参数 stack 成一个张量，一次性更新。
+        Stack 的好处：(1) 减少 kernel launch 次数  (2) 正交化在更大矩阵上更稳定
         """
         params: list[Tensor] = group['params']
         if not params:
             return
 
-        # Get or create group-level buffers (stored in first param's state for convenience)
+        # 将状态存在第一个参数的 state 字典中（方便）
         p = params[0]
         state = self.state[p]
         num_params = len(params)
         shape, device, dtype = p.shape, p.device, p.dtype
 
-        # Momentum for every individual parameter
+        # 一阶动量 buffer（每个参数独立）
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored, either per-row or per-column
+        # 二阶动量 buffer 是因式分解的：只沿较长维度存储（节省内存）
+        # 例如 (768, 3072) → 存 (N, 768, 1)；(3072, 768) → 存 (N, 1, 768)
         if "second_momentum_buffer" not in state:
             state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        red_dim = -1 if shape[-2] >= shape[-1] else -2  # 沿较长维度 reduce
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
+        # Stack 所有参数的梯度和参数值（要求同 shape）
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
 
-        # Fill all the 0-D tensors with current values
+        # 填充 0-D tensor 并调用融合 kernel
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        # LR 按 √(rows/cols) 缩放：高矩阵需要更大的步长以补偿正交化的尺度差异
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
         muon_step_fused(
             stacked_grads,
             stacked_params,
@@ -277,7 +292,7 @@ class MuonAdamW(torch.optim.Optimizer):
             red_dim,
         )
 
-        # Copy back to original params
+        # 从 stack 复制回各个参数
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
@@ -291,66 +306,44 @@ class MuonAdamW(torch.optim.Optimizer):
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
 # -----------------------------------------------------------------------------
-# Distributed version of the MuonAdamW optimizer.
-# Used for training on multiple GPUs.
+# 分布式版 MuonAdamW 优化器
+# 多 GPU 训练使用，自带 ZeRO-2 风格的梯度分片和异步通信
 
 class DistMuonAdamW(torch.optim.Optimizer):
     """
-    Combined distributed optimizer: Muon for 2D matrix params, AdamW for others.
+    分布式混合优化器：矩阵参数用 Muon，其他用 AdamW。
 
-    See MuonAdamW for the algorithmic details of each optimizer. This class adds
-    distributed communication to enable multi-GPU training without PyTorch DDP.
+    算法细节见 MuonAdamW。本类增加分布式通信以支持多 GPU 训练（不依赖 PyTorch DDP）。
 
-    Design Goals:
-    - Overlap communication with computation (async ops)
-    - Minimize memory by sharding optimizer states across ranks (ZeRO-2 style)
-    - Batch small tensors into single comm ops where possible
+    设计目标：
+    - 通信与计算重叠（异步操作）
+    - 优化器状态按 rank 分片以省显存（ZeRO-2 风格）
+    - 小张量合并为单次通信
 
-    Communication Pattern (3-phase async):
-    We use a 3-phase structure to maximize overlap between communication and compute:
+    3 阶段异步通信设计：
 
-        Phase 1: Launch all async reduce ops
-            - Kick off all reduce_scatter/all_reduce operations
-            - Don't wait - let them run in background while we continue
+        阶段1: 启动所有异步 reduce 操作
+            - 发起 reduce_scatter / all_reduce
+            - 不等待，让通信在后台运行
 
-        Phase 2: Wait for reduces, compute updates, launch gathers
-            - For each group: wait for its reduce, compute the update, launch gather
-            - By processing groups in order, earlier gathers run while later computes happen
+        阶段2: 等 reduce 完成 → 计算更新 → 启动 gather
+            - 按组顺序处理：等 reduce → 计算 → 发 gather
+            - 先处理的组的 gather 在后续组计算时并行运行
 
-        Phase 3: Wait for gathers, copy back
-            - Wait for all gathers to complete
-            - Copy updated params back to original tensors (Muon only)
+        阶段3: 等 gather 完成 → 复制回原参数
+            - 等所有 gather 结束
+            - 把更新后的参数写回（仅 Muon 需要）
 
-    AdamW Communication (ZeRO-2 style):
-    - Small params (<1024 elements): all_reduce gradients, update full param on each rank.
-      Optimizer state is replicated but these params are tiny (scalars, biases).
-    - Large params: reduce_scatter gradients so each rank gets 1/N of the grad, update
-      only that slice, then all_gather the updated slices. Optimizer state (exp_avg,
-      exp_avg_sq) is sharded - each rank only stores state for its slice.
-      Requires param.shape[0] divisible by world_size.
+    AdamW 通信策略（ZeRO-2 风格）：
+    - 小参数（<1024 元素）：all_reduce 梯度，每个 rank 更新完整参数（状态冗余但参数极小）
+    - 大参数：reduce_scatter 梯度 → 每个 rank 只更新 1/N 切片 → all_gather 回来
+      优化器状态只存本 rank 的切片 → 显存节省 N 倍
 
-    Muon Communication (stacked + chunked):
-    - All params in a Muon group must have the same shape (caller's responsibility).
-    - Stack all K params into a single (K, *shape) tensor for efficient comm.
-    - Divide K params across N ranks: each rank "owns" ceil(K/N) params.
-    - reduce_scatter the stacked grads so each rank gets its chunk.
-    - Each rank computes Muon update only for params it owns.
-    - all_gather the updated params back to all ranks.
-    - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
-    - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
-      then ignore the padding when copying back.
-
-    Buffer Reuse:
-    - For Muon, we allocate stacked_grads for reduce_scatter input, then reuse the
-      same buffer as the output for all_gather (stacked_params). This saves memory
-      since we don't need both buffers simultaneously.
-
-    Arguments:
-        param_groups: List of dicts, each containing:
-            - 'params': List of parameters
-            - 'kind': 'adamw' or 'muon'
-            - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+    Muon 通信策略（stack + 分块）：
+    - 同组参数必须同 shape → stack 成 (K, *shape) 张量
+    - K 个参数分给 N 个 rank，每个 rank "拥有" ceil(K/N) 个
+    - reduce_scatter 梯度 → 每个 rank 只算自己那块 → all_gather 回来
+    - 不整除时 zero-pad，复制回时忽略 padding
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -367,7 +360,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
+        """阶段1-AdamW：启动异步 reduce 操作。小参数 all_reduce，大参数 reduce_scatter。"""
         param_infos = {}
         for p in group['params']:
             grad = p.grad
@@ -385,7 +378,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         return dict(param_infos=param_infos)
 
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce op for Muon group. Returns info dict."""
+        """阶段1-Muon：将同 shape 参数 stack → zero-pad 到能整除 world_size → reduce_scatter。"""
         params = group['params']
         chunk_size = (len(params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
@@ -406,7 +399,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
-        """Wait for reduce, compute AdamW updates, launch gathers for large params."""
+        """阶段2-AdamW：等 reduce → 在本 rank 的切片上做 AdamW 更新 → 发起 all_gather。"""
         param_infos = info['param_infos']
         for p in group['params']:
             pinfo = param_infos[p]
@@ -447,7 +440,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
-        """Wait for reduce, compute Muon updates, launch gather."""
+        """阶段2-Muon：等 reduce → 只算本 rank 拥有的参数块 → 发起 all_gather。
+        注意：复用 stacked_grads 的内存作为 all_gather 的输出 buffer（省显存）。"""
         info['future'].wait()
         params = group['params']
         chunk_size = info['chunk_size']
@@ -497,7 +491,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     def _finish_gathers(self, gather_list: list) -> None:
-        """Wait for all gathers and copy Muon params back."""
+        """阶段3：等所有 all_gather 完成，将 Muon 的 stacked buffer 复制回各个独立参数。"""
         for info in gather_list:
             info["future"].wait()
             if info["params"] is not None:
@@ -509,7 +503,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        # Phase 1: launch all async reduce ops
+        # 阶段1: 批量启动所有异步 reduce 操作（通信在后台进行）
         reduce_infos: list[dict] = []
         for group in self.param_groups:
             if group['kind'] == 'adamw':
@@ -519,7 +513,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
-        # Phase 2: wait for reduces, compute updates, launch gathers
+        # 阶段2: 逐组等 reduce → 计算更新 → 启动 gather（前面组的 gather 与后面组的计算重叠）
         gather_list: list[dict] = []
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw':
@@ -529,5 +523,5 @@ class DistMuonAdamW(torch.optim.Optimizer):
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
-        # Phase 3: wait for gathers, copy back
+        # 阶段3: 等所有 gather 完成，将参数写回
         self._finish_gathers(gather_list)
